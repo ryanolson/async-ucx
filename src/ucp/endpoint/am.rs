@@ -1,6 +1,7 @@
 use crossbeam::queue::SegQueue;
 use tokio::sync::Notify;
 
+use super::param::RequestParam;
 use super::*;
 use std::{
     io::{IoSlice, IoSliceMut},
@@ -8,7 +9,7 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
-//// Active message protocol.
+/// Active message protocol.
 /// Active message protocol is a mechanism for sending and receiving messages
 /// between processes in a distributed system.
 /// It allows a process to send a message to another process, which can then
@@ -221,7 +222,7 @@ impl<'a> AmMsg<'a> {
             }
             Some(AmData::Data(data)) => {
                 // data message, no need to receive
-                let size = copy_data_to_iov(&data, iov)?;
+                let size = copy_data_to_iov(data, iov)?;
                 self.drop_msg(AmData::Data(data));
                 Ok(size)
             }
@@ -249,22 +250,12 @@ impl<'a> AmMsg<'a> {
                     self.worker.handle,
                     iov.len()
                 );
-                let mut param = MaybeUninit::<ucp_request_param_t>::uninit();
-                let (buffer, count) = unsafe {
-                    let param = &mut *param.as_mut_ptr();
-                    param.op_attr_mask = ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK as u32
-                        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_DATATYPE as u32;
-                    param.cb = ucp_request_param_t__bindgen_ty_1 {
-                        recv_am: Some(callback),
-                    };
 
-                    if iov.len() == 1 {
-                        param.datatype = ucp_dt_make_contig(1);
-                        (iov[0].as_ptr(), iov[0].len())
-                    } else {
-                        param.datatype = ucp_dt_type::UCP_DATATYPE_IOV as _;
-                        (iov.as_ptr() as _, iov.len())
-                    }
+                let param = RequestParam::new().cb_recv_am(Some(callback));
+                let (buffer, count, param) = if iov.len() == 1 {
+                    (iov[0].as_ptr(), iov[0].len(), param)
+                } else {
+                    (iov.as_ptr() as _, iov.len(), param.iov())
                 };
 
                 let status = unsafe {
@@ -273,7 +264,7 @@ impl<'a> AmMsg<'a> {
                         data_desc as _,
                         buffer as _,
                         count as _,
-                        param.as_ptr(),
+                        param.as_ref(),
                     )
                 };
                 if status.is_null() {
@@ -282,9 +273,9 @@ impl<'a> AmMsg<'a> {
                 } else if UCS_PTR_IS_PTR(status) {
                     RequestHandle {
                         ptr: status,
-                        poll_fn: poll_recv,
+                        poll_fn: poll_normal,
                     }
-                    .await;
+                    .await?;
                     Ok(data_len)
                 } else {
                     Err(Error::from_ptr(status).unwrap_err())
@@ -304,12 +295,21 @@ impl<'a> AmMsg<'a> {
             && !self.msg.reply_ep.is_null()
     }
 
+    /// return endpoint handler
+    pub fn reply_ep(&self) -> Option<EndpointHandler> {
+        if self.need_reply() {
+            Some(EndpointHandler(self.msg.reply_ep))
+        } else {
+            None
+        }
+    }
+
     /// Send reply
     /// # Safety
     /// User needs to ensure that the endpoint isn't closed.
     pub async unsafe fn reply(
         &self,
-        id: u32,
+        id: u16,
         header: &[u8],
         data: &[u8],
         need_reply: bool,
@@ -327,7 +327,7 @@ impl<'a> AmMsg<'a> {
     /// User needs to ensure that the endpoint isn't closed.
     pub async unsafe fn reply_vectorized(
         &self,
-        id: u32,
+        id: u16,
         header: &[u8],
         data: &[IoSlice<'_>],
         need_reply: bool,
@@ -439,8 +439,8 @@ impl Worker {
             param: *const ucp_am_recv_param_t,
         ) -> ucs_status_t {
             let handler = &*(arg as *const AmStreamInner);
-            let header = slice::from_raw_parts(header as *const u8, header_len as usize);
-            let data = slice::from_raw_parts(data as *const u8, data_len as usize);
+            let header = slice::from_raw_parts(header as *const u8, header_len);
+            let data = slice::from_raw_parts(data as *const u8, data_len);
 
             let param = &*param;
             handler.callback(header, data, param.reply_ep, param.recv_attr);
@@ -460,7 +460,7 @@ impl Worker {
         }
         self.am_streams.write().unwrap().insert(id, stream.clone());
 
-        return Ok(AmStream::new(self, stream));
+        Ok(AmStream::new(self, stream))
     }
 
     /// Register active message handler for `id`.
@@ -497,7 +497,7 @@ impl Endpoint {
     /// Send active message.
     pub async fn am_send(
         &self,
-        id: u32,
+        id: u16,
         header: &[u8],
         data: &[u8],
         need_reply: bool,
@@ -511,7 +511,7 @@ impl Endpoint {
     /// Send active message.
     pub async fn am_send_vectorized(
         &self,
-        id: u32,
+        id: u16,
         header: &[u8],
         data: &[IoSlice<'_>],
         need_reply: bool,
@@ -534,7 +534,7 @@ pub enum AmProto {
 
 async fn am_send(
     endpoint: ucp_ep_h,
-    id: u32,
+    id: u16,
     header: &[u8],
     data: &[IoSlice<'_>],
     need_reply: bool,
@@ -546,45 +546,33 @@ async fn am_send(
         request.waker.wake();
     }
 
-    let mut param = MaybeUninit::<ucp_request_param_t>::uninit();
-    let (buffer, count) = unsafe {
-        let param = &mut *param.as_mut_ptr();
-        param.op_attr_mask = ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK as u32
-            | ucp_op_attr_t::UCP_OP_ATTR_FIELD_DATATYPE as u32
-            | ucp_op_attr_t::UCP_OP_ATTR_FIELD_FLAGS as u32;
-        param.flags = 0;
-        param.cb = ucp_request_param_t__bindgen_ty_1 {
-            send: Some(callback),
-        };
-
-        match proto {
-            Some(AmProto::Eager) => param.flags |= ucp_send_am_flags::UCP_AM_SEND_FLAG_EAGER.0,
-            Some(AmProto::Rndv) => param.flags |= ucp_send_am_flags::UCP_AM_SEND_FLAG_RNDV.0,
-            _ => (),
-        }
-
-        if need_reply {
-            param.flags |= ucp_send_am_flags::UCP_AM_SEND_FLAG_REPLY.0;
-        }
-
-        if data.len() == 1 {
-            param.datatype = ucp_dt_make_contig(1);
-            (data[0].as_ptr(), data[0].len())
-        } else {
-            param.datatype = ucp_dt_type::UCP_DATATYPE_IOV as _;
-            (data.as_ptr() as _, data.len())
-        }
+    // Use RequestParam builder for send
+    let param = RequestParam::new().cb_send(Some(callback));
+    let param = match proto {
+        Some(AmProto::Eager) => param.set_flag_eager(),
+        Some(AmProto::Rndv) => param.set_flag_rndv(),
+        None => param,
+    };
+    let param = if need_reply {
+        param.set_flag_reply()
+    } else {
+        param
+    };
+    let (buffer, count, param) = if data.len() == 1 {
+        (data[0].as_ptr(), data[0].len(), param)
+    } else {
+        (data.as_ptr() as _, data.len(), param.iov())
     };
 
     let status = unsafe {
         ucp_am_send_nbx(
             endpoint,
-            id,
+            id as u32,
             header.as_ptr() as _,
             header.len() as _,
             buffer as _,
             count as _,
-            param.as_mut_ptr(),
+            param.as_ref(),
         )
     };
     if status.is_null() {
@@ -601,15 +589,6 @@ async fn am_send(
     }
 }
 
-unsafe fn poll_recv(ptr: ucs_status_ptr_t) -> Poll<()> {
-    let status = ucp_request_check_status(ptr as _);
-    if status == ucs_status_t::UCS_INPROGRESS {
-        Poll::Pending
-    } else {
-        Poll::Ready(())
-    }
-}
-
 #[cfg(test)]
 #[cfg(feature = "am")]
 mod tests {
@@ -617,7 +596,7 @@ mod tests {
 
     #[test_log::test]
     fn am() {
-        let protos = vec![None, Some(AmProto::Eager), Some(AmProto::Rndv)];
+        let protos = [None, Some(AmProto::Eager), Some(AmProto::Rndv)];
         for block_size_shift in 0..20_usize {
             for p in protos.iter() {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -671,13 +650,13 @@ mod tests {
                 let msg = stream1.wait_msg().await;
                 let mut msg = msg.expect("no msg");
                 assert_eq!(msg.header(), &header);
-                assert_eq!(msg.contains_data(), true);
+                assert!(msg.contains_data());
                 assert_eq!(msg.data_len(), data.len());
                 let mut recv_data = vec![0_u8; msg.data_len()];
                 let recv_len = msg.recv_data_single(&mut recv_data).await.unwrap();
                 assert_eq!(data.len(), recv_len);
                 assert_eq!(data, recv_data);
-                assert_eq!(msg.contains_data(), false);
+                assert!(!msg.contains_data());
                 msg
             }
         );
@@ -695,11 +674,11 @@ mod tests {
                 let reply = stream2.wait_msg().await;
                 let mut reply = reply.expect("no reply");
                 assert_eq!(reply.header(), &header);
-                assert_eq!(reply.contains_data(), true);
+                assert!(reply.contains_data());
                 assert_eq!(reply.data_len(), data.len());
                 let recv_data = reply.recv_data().await.unwrap();
                 assert_eq!(data, recv_data);
-                assert_eq!(reply.contains_data(), false);
+                assert!(!reply.contains_data());
             }
         );
 

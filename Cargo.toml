@@ -1,7 +1,7 @@
 [package]
 name = "async-ucx"
-version = "0.1.1"
-authors = ["Runji Wang <wangrunji0408@163.com>", "Yiyuan Liu <yiyuanliu1997@gmail.com>"]
+version = "0.2.0"
+authors = ["Runji Wang <wangrunji0408@163.com>", "Yiyuan Liu <yiyuanliu1997@gmail.com>", "Kaiwei Li <chnlkw@gmail.com>"]
 edition = "2021"
 description = "Asynchronous Rust bindings to UCX."
 homepage = "https://github.com/madsys-dev/async-ucx"
@@ -15,21 +15,23 @@ categories = ["asynchronous", "api-bindings", "network-programming"]
 [features]
 event = ["tokio"]
 am = ["tokio/sync", "crossbeam"]
+util = ["tokio"]
 
 [dependencies]
-ucx1-sys = { version = "0.1", path = "ucx1-sys" }
+ucx1-sys = { version = "0.2", path = "ucx1-sys" }
 socket2 = "0.4"
 futures = "0.3"
 futures-lite = "1.11"
 lazy_static = "1.4"
 log = "0.4"
 tokio = { version = "1.0", features = ["net"], optional = true }
-crossbeam = { version = "0.8", optional = true }
+crossbeam = { version = "0.8", features = ["alloc"], optional = true }
 derivative = "2.2.0"
 thiserror = "1.0"
+pin-project = "1.1.10"
 
 [dev-dependencies]
-tokio = { version = "1.0", features = ["rt", "time", "macros", "sync"] }
+tokio = { version = "1.0", features = ["rt", "time", "macros", "sync", "io-util"] }
 env_logger = "0.9"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.2.17", default-features = false, features = ["env-filter", "fmt"] }

@@ -9,13 +9,18 @@ use std::task::Poll;
 
 #[cfg(feature = "am")]
 mod am;
+mod param;
 mod rma;
 mod stream;
 mod tag;
+#[cfg(feature = "util")]
+mod util;
 
 #[cfg(feature = "am")]
 pub use self::am::*;
 pub use self::rma::*;
+#[cfg(feature = "util")]
+pub use self::util::*;
 
 // State associate with ucp_ep_h
 // todo: Add a `get_user_data` to UCX
@@ -77,6 +82,12 @@ pub struct Endpoint {
     handle: ucp_ep_h,
     inner: Rc<EndpointInner>,
 }
+
+/// Type alias of Endpoint handler
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EndpointHandler(ucp_ep_h);
+unsafe impl Sync for EndpointHandler {}
+unsafe impl Send for EndpointHandler {}
 
 impl Endpoint {
     fn create(worker: &Rc<Worker>, mut params: ucp_ep_params) -> Result<Self, Error> {
@@ -200,6 +211,11 @@ impl Endpoint {
         Ok(self.handle)
     }
 
+    /// Get the endpoint handler
+    pub fn handler(&self) -> Result<EndpointHandler, Error> {
+        Ok(EndpointHandler(self.get_handle()?))
+    }
+
     /// Print endpoint information to stderr.
     pub fn print_to_stderr(&self) {
         if !self.inner.is_closed() {
@@ -252,7 +268,7 @@ impl Endpoint {
             Ok(())
         } else if UCS_PTR_IS_PTR(status) {
             let result = loop {
-                if let Poll::Ready(result) = unsafe { poll_normal(status) } {
+                if let Poll::Ready(result) = poll_normal(status) {
                     unsafe { ucp_request_free(status as _) };
                     break result;
                 } else {
@@ -303,18 +319,18 @@ impl Drop for Endpoint {
 /// A handle to the request returned from async IO functions.
 struct RequestHandle<T> {
     ptr: ucs_status_ptr_t,
-    poll_fn: unsafe fn(ucs_status_ptr_t) -> Poll<T>,
+    poll_fn: fn(ucs_status_ptr_t) -> Poll<T>,
 }
 
 impl<T> Future for RequestHandle<T> {
     type Output = T;
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {
-        if let ret @ Poll::Ready(_) = unsafe { (self.poll_fn)(self.ptr) } {
+        if let ret @ Poll::Ready(_) = { (self.poll_fn)(self.ptr) } {
             return ret;
         }
         let request = unsafe { &mut *(self.ptr as *mut Request) };
         request.waker.register(cx.waker());
-        unsafe { (self.poll_fn)(self.ptr) }
+        (self.poll_fn)(self.ptr)
     }
 }
 
@@ -325,8 +341,32 @@ impl<T> Drop for RequestHandle<T> {
     }
 }
 
-unsafe fn poll_normal(ptr: ucs_status_ptr_t) -> Poll<Result<(), Error>> {
-    let status = ucp_request_check_status(ptr as _);
+enum Status<T> {
+    Completed(Result<T, Error>),
+    Scheduled(RequestHandle<Result<T, Error>>),
+}
+
+impl<T> Status<T> {
+    pub fn from(
+        status: *mut c_void,
+        immediate: MaybeUninit<T>,
+        poll_fn: fn(ucs_status_ptr_t) -> Poll<Result<T, Error>>,
+    ) -> Self {
+        if status.is_null() {
+            Self::Completed(Ok(unsafe { immediate.assume_init() }))
+        } else if UCS_PTR_IS_ERR(status) {
+            Self::Completed(Err(Error::from_error(UCS_PTR_RAW_STATUS(status))))
+        } else {
+            Self::Scheduled(RequestHandle {
+                ptr: status,
+                poll_fn,
+            })
+        }
+    }
+}
+
+fn poll_normal(ptr: ucs_status_ptr_t) -> Poll<Result<(), Error>> {
+    let status = unsafe { ucp_request_check_status(ptr as _) };
     if status == ucs_status_t::UCS_INPROGRESS {
         Poll::Pending
     } else {
