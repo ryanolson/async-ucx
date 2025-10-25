@@ -143,8 +143,12 @@ fn build_from_source() -> String {
         .status()
         .expect("failed to make install");
 
-    // Tell cargo to link the library (only needed when building from source)
-    println!("cargo:rustc-link-lib=ucp");
+    // Tell cargo to link all UCX libraries (only needed when building from source)
+    // When building static libraries, we need to link them in dependency order
+    println!("cargo:rustc-link-lib=static=ucp");
+    println!("cargo:rustc-link-lib=static=uct");
+    println!("cargo:rustc-link-lib=static=ucs");
+    println!("cargo:rustc-link-lib=static=ucm");
 
     dst.join("include").display().to_string()
 }
