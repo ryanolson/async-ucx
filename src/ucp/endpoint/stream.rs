@@ -3,7 +3,8 @@ use super::*;
 
 impl Endpoint {
     pub(super) fn stream_send_impl(&self, buf: &[u8]) -> Result<Status<()>, Error> {
-        trace!("stream_send: endpoint={:?} len={}", self.handle, buf.len());
+        let handle = self.get_handle()?;
+        trace!("stream_send: endpoint={:?} len={}", handle, buf.len());
         unsafe extern "C" fn callback(
             request: *mut c_void,
             status: ucs_status_t,
@@ -50,7 +51,8 @@ impl Endpoint {
         &self,
         buf: &mut [MaybeUninit<u8>],
     ) -> Result<Status<usize>, Error> {
-        trace!("stream_recv: endpoint={:?} len={}", self.handle, buf.len());
+        let handle = self.get_handle()?;
+        trace!("stream_recv: endpoint={:?} len={}", handle, buf.len());
         unsafe extern "C" fn callback(
             request: *mut c_void,
             status: ucs_status_t,

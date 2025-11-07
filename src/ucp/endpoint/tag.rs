@@ -127,7 +127,8 @@ impl Worker {
 
 impl Endpoint {
     pub(super) fn tag_send_impl(&self, tag: u64, buf: &[u8]) -> Result<Status<()>, Error> {
-        trace!("tag_send: endpoint={:?} len={}", self.handle, buf.len());
+        let handle = self.get_handle()?;
+        trace!("tag_send: endpoint={:?} len={}", handle, buf.len());
         unsafe extern "C" fn callback(
             request: *mut c_void,
             status: ucs_status_t,
@@ -169,9 +170,10 @@ impl Endpoint {
 
     /// Like `tag_send`, except that it reads into a slice of buffers.
     pub async fn tag_send_vectored(&self, tag: u64, iov: &[IoSlice<'_>]) -> Result<usize, Error> {
+        let handle = self.get_handle()?;
         trace!(
             "tag_send_vectored: endpoint={:?} iov.len={}",
-            self.handle,
+            handle,
             iov.len()
         );
         unsafe extern "C" fn callback(
