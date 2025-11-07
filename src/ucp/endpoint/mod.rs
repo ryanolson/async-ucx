@@ -9,30 +9,51 @@ use std::task::Poll;
 
 #[cfg(feature = "am")]
 mod am;
+mod param;
 mod rma;
 mod stream;
 mod tag;
+#[cfg(feature = "util")]
+mod util;
 
 #[cfg(feature = "am")]
 pub use self::am::*;
 pub use self::rma::*;
+#[cfg(feature = "util")]
+pub use self::util::*;
 
 // State associate with ucp_ep_h
-// todo: Add a `get_user_data` to UCX
-#[derive(Debug)]
+// This owns the UCX endpoint handle and closes it when the last Rc reference drops
 struct EndpointInner {
+    handle: Cell<ucp_ep_h>,
     closed: AtomicBool,
     status: Cell<ucs_status_t>,
     worker: Rc<Worker>,
 }
 
+impl std::fmt::Debug for EndpointInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndpointInner")
+            .field("handle", &self.handle.get())
+            .field("closed", &self.closed)
+            .field("worker", &self.worker)
+            .finish()
+    }
+}
+
 impl EndpointInner {
-    fn new(worker: Rc<Worker>) -> Self {
+    fn new(handle: ucp_ep_h, worker: Rc<Worker>) -> Self {
         EndpointInner {
+            handle: Cell::new(handle),
             closed: AtomicBool::new(false),
             status: Cell::new(ucs_status_t::UCS_OK),
             worker,
         }
+    }
+
+    #[inline(always)]
+    fn get_handle(&self) -> ucp_ep_h {
+        self.handle.get()
     }
 
     fn closed(self: &Rc<Self>) {
@@ -71,20 +92,78 @@ impl EndpointInner {
     }
 }
 
+impl Drop for EndpointInner {
+    fn drop(&mut self) {
+        // This runs when the LAST Rc<EndpointInner> reference drops
+        // All Endpoint clones must be gone before this runs
+        let handle = self.handle.get();
+        if !handle.is_null() && !self.is_closed() {
+            // Try graceful close first (FLUSH mode - completes pending operations)
+            let status = unsafe {
+                ucp_ep_close_nb(handle, ucp_ep_close_mode::UCP_EP_CLOSE_MODE_FLUSH as u32)
+            };
+
+            if status.is_null() {
+                // Graceful close completed immediately
+                trace!("destroy endpoint={:?} (graceful close)", handle);
+            } else if UCS_PTR_IS_PTR(status) {
+                // Graceful close returned pending request
+                // Can't wait in Drop context - cancel and force close
+                trace!(
+                    "destroy endpoint={:?} (graceful pending, using force)",
+                    handle
+                );
+                unsafe {
+                    ucp_request_cancel(self.worker.handle, status as _);
+                    ucp_request_free(status as _);
+                }
+                // Now force close
+                let status = unsafe {
+                    ucp_ep_close_nb(handle, ucp_ep_close_mode::UCP_EP_CLOSE_MODE_FORCE as u32)
+                };
+                let _ =
+                    Error::from_ptr(status).map_err(|err| error!("Failed to force close, {}", err));
+            } else {
+                // Graceful close returned error (e.g. peer already closed)
+                // Use force to clean up
+                trace!(
+                    "destroy endpoint={:?} (graceful failed, using force)",
+                    handle
+                );
+                let status = unsafe {
+                    ucp_ep_close_nb(handle, ucp_ep_close_mode::UCP_EP_CLOSE_MODE_FORCE as u32)
+                };
+                let _ =
+                    Error::from_ptr(status).map_err(|err| error!("Failed to force close, {}", err));
+            }
+
+            // Mark as closed
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// Communication endpoint.
+/// Cloning an Endpoint creates a new reference to the same underlying UCX connection.
+/// The connection closes when the last Endpoint clone is dropped.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
-    handle: ucp_ep_h,
     inner: Rc<EndpointInner>,
 }
 
+/// Type alias of Endpoint handler
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EndpointHandler(ucp_ep_h);
+unsafe impl Sync for EndpointHandler {}
+unsafe impl Send for EndpointHandler {}
+
 impl Endpoint {
     fn create(worker: &Rc<Worker>, mut params: ucp_ep_params) -> Result<Self, Error> {
-        let inner = Rc::new(EndpointInner::new(worker.clone()));
+        // Temporarily create inner with null handle (will be updated)
+        let inner = Rc::new(EndpointInner::new(std::ptr::null_mut(), worker.clone()));
         let weak = Rc::downgrade(&inner);
 
-        // ucp endpoint keep a weak reference to inner
-        // this reference will drop when endpoint is closed
+        // ucp endpoint keep a weak reference to inner for error callback
         let ptr = Weak::into_raw(weak);
         unsafe extern "C" fn callback(arg: *mut c_void, ep: ucp_ep_h, status: ucs_status_t) {
             let weak: Weak<EndpointInner> = Weak::from_raw(arg as _);
@@ -118,8 +197,12 @@ impl Endpoint {
         }
 
         let handle = unsafe { handle.assume_init() };
+
+        // Update the handle in the inner (via Cell, no unsafe needed)
+        inner.handle.set(handle);
+
         trace!("create endpoint={:?}", handle);
-        Ok(Self { handle, inner })
+        Ok(Self { inner })
     }
 
     pub(super) async fn connect_socket(
@@ -197,13 +280,26 @@ impl Endpoint {
     #[inline]
     fn get_handle(&self) -> Result<ucp_ep_h, Error> {
         self.inner.check()?;
-        Ok(self.handle)
+        let handle = self.inner.get_handle();
+        if handle.is_null() {
+            Err(Error::from_error(ucs_status_t::UCS_ERR_NO_RESOURCE))
+        } else {
+            Ok(handle)
+        }
+    }
+
+    /// Get the endpoint handler
+    pub fn handler(&self) -> Result<EndpointHandler, Error> {
+        Ok(EndpointHandler(self.get_handle()?))
     }
 
     /// Print endpoint information to stderr.
     pub fn print_to_stderr(&self) {
         if !self.inner.is_closed() {
-            unsafe { ucp_ep_print_info(self.handle, stderr) };
+            let handle = self.inner.get_handle();
+            if !handle.is_null() {
+                unsafe { ucp_ep_print_info(handle, stderr) };
+            }
         }
     }
 
@@ -239,20 +335,21 @@ impl Endpoint {
             self.get_status()?;
         }
 
-        trace!("close: endpoint={:?}", self.handle);
+        let handle = self.get_handle()?;
+        trace!("close: endpoint={:?}", handle);
         let mode = if force {
             ucp_ep_close_mode::UCP_EP_CLOSE_MODE_FORCE as u32
         } else {
             ucp_ep_close_mode::UCP_EP_CLOSE_MODE_FLUSH as u32
         };
-        let status = unsafe { ucp_ep_close_nb(self.handle, mode) };
+        let status = unsafe { ucp_ep_close_nb(handle, mode) };
         if status.is_null() {
             trace!("close: complete");
             self.inner.closed();
             Ok(())
         } else if UCS_PTR_IS_PTR(status) {
             let result = loop {
-                if let Poll::Ready(result) = unsafe { poll_normal(status) } {
+                if let Poll::Ready(result) = poll_normal(status) {
                     unsafe { ucp_request_free(status as _) };
                     break result;
                 } else {
@@ -284,37 +381,25 @@ impl Endpoint {
     }
 }
 
-impl Drop for Endpoint {
-    fn drop(&mut self) {
-        if !self.inner.is_closed() {
-            trace!("destroy endpoint={:?}", self.handle);
-            let status = unsafe {
-                ucp_ep_close_nb(
-                    self.handle,
-                    ucp_ep_close_mode::UCP_EP_CLOSE_MODE_FORCE as u32,
-                )
-            };
-            let _ = Error::from_ptr(status).map_err(|err| error!("Failed to force close, {}", err));
-            self.inner.closed();
-        }
-    }
-}
+// Drop for Endpoint no longer needed - EndpointInner::Drop handles cleanup
+// when the last Rc reference is dropped. This ensures endpoints stay alive
+// when cloned/cached, fixing bidirectional communication.
 
 /// A handle to the request returned from async IO functions.
 struct RequestHandle<T> {
     ptr: ucs_status_ptr_t,
-    poll_fn: unsafe fn(ucs_status_ptr_t) -> Poll<T>,
+    poll_fn: fn(ucs_status_ptr_t) -> Poll<T>,
 }
 
 impl<T> Future for RequestHandle<T> {
     type Output = T;
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {
-        if let ret @ Poll::Ready(_) = unsafe { (self.poll_fn)(self.ptr) } {
+        if let ret @ Poll::Ready(_) = { (self.poll_fn)(self.ptr) } {
             return ret;
         }
         let request = unsafe { &mut *(self.ptr as *mut Request) };
         request.waker.register(cx.waker());
-        unsafe { (self.poll_fn)(self.ptr) }
+        (self.poll_fn)(self.ptr)
     }
 }
 
@@ -325,8 +410,32 @@ impl<T> Drop for RequestHandle<T> {
     }
 }
 
-unsafe fn poll_normal(ptr: ucs_status_ptr_t) -> Poll<Result<(), Error>> {
-    let status = ucp_request_check_status(ptr as _);
+enum Status<T> {
+    Completed(Result<T, Error>),
+    Scheduled(RequestHandle<Result<T, Error>>),
+}
+
+impl<T> Status<T> {
+    pub fn from(
+        status: *mut c_void,
+        immediate: MaybeUninit<T>,
+        poll_fn: fn(ucs_status_ptr_t) -> Poll<Result<T, Error>>,
+    ) -> Self {
+        if status.is_null() {
+            Self::Completed(Ok(unsafe { immediate.assume_init() }))
+        } else if UCS_PTR_IS_ERR(status) {
+            Self::Completed(Err(Error::from_error(UCS_PTR_RAW_STATUS(status))))
+        } else {
+            Self::Scheduled(RequestHandle {
+                ptr: status,
+                poll_fn,
+            })
+        }
+    }
+}
+
+fn poll_normal(ptr: ucs_status_ptr_t) -> Poll<Result<(), Error>> {
+    let status = unsafe { ucp_request_check_status(ptr as _) };
     if status == ucs_status_t::UCS_INPROGRESS {
         Poll::Pending
     } else {

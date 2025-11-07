@@ -3,31 +3,27 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    let dst = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-
-    // Tell cargo to tell rustc to link the library.
-    println!("cargo:rustc-link-search=native={}/lib", dst.display());
-    println!("cargo:rustc-link-lib=ucp");
-    // println!("cargo:rustc-link-lib=uct");
-    // println!("cargo:rustc-link-lib=ucs");
-    // println!("cargo:rustc-link-lib=ucm");
-
     // Tell cargo to invalidate the built crate whenever the wrapper changes
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-env-changed=UCX_NO_PKG_CONFIG");
 
-    build_from_source();
+    // Determine whether to use system UCX or build from source
+    let (include_path, use_system) = if env::var("UCX_NO_PKG_CONFIG").is_ok() {
+        println!("cargo:warning=UCX_NO_PKG_CONFIG set, building from source");
+        (build_from_source(), false)
+    } else if let Some(include) = try_system_ucx() {
+        println!("cargo:warning=Using system UCX installation");
+        (include, true)
+    } else {
+        println!("cargo:warning=System UCX not found or incompatible, building from source");
+        (build_from_source(), false)
+    };
 
-    // The bindgen::Builder is the main entry point
-    // to bindgen, and lets you build up options for
-    // the resulting bindings.
+    // Generate bindings
     let bindings = bindgen::Builder::default()
-        .clang_arg(format!("-I{}", dst.join("include").display()))
-        // The input header we would like to generate bindings for.
+        .clang_arg(format!("-I{}", include_path))
         .header("wrapper.h")
-        // Tell cargo to invalidate the built crate whenever any of the
-        // included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
-        // .parse_callbacks(Box::new(ignored_macros))
         .allowlist_function("uc[tsmp]_.*")
         .allowlist_var("uc[tsmp]_.*")
         .allowlist_var("UC[TSMP]_.*")
@@ -36,19 +32,58 @@ fn main() {
         .bitfield_enum("ucp_feature")
         .bitfield_enum(".*_field")
         .bitfield_enum(".*_flags(_t)?")
-        // Finish the builder and generate the bindings.
         .generate()
-        // Unwrap the Result and panic on failure.
         .expect("Unable to generate bindings");
 
-    // Write the bindings to the $OUT_DIR/bindings.rs file.
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
+
+    // If we built from source, tell cargo where to find the libraries
+    if !use_system {
+        println!("cargo:rustc-link-search=native={}/lib", out_path.display());
+    }
 }
 
-fn build_from_source() {
+/// Try to use system UCX via pkg-config.
+/// Returns the include path if successful, None otherwise.
+fn try_system_ucx() -> Option<String> {
+    match pkg_config::Config::new()
+        .atleast_version("1.19")
+        .cargo_metadata(true)
+        .probe("ucx")
+    {
+        Ok(library) => {
+            // Check that version is < 2.0
+            let version = &library.version;
+            let parts: Vec<&str> = version.split('.').collect();
+            if let Some(major) = parts.first().and_then(|s| s.parse::<u32>().ok()) {
+                if major >= 2 {
+                    println!(
+                        "cargo:warning=Found UCX version {} but require < 2.0",
+                        version
+                    );
+                    return None;
+                }
+            }
+
+            // pkg-config automatically adds link directives via cargo_metadata(true)
+            // Now we need to return an include path for bindgen
+            if let Some(include_path) = library.include_paths.first() {
+                return Some(include_path.display().to_string());
+            }
+            None
+        }
+        Err(e) => {
+            println!("cargo:warning=pkg-config failed: {}", e);
+            None
+        }
+    }
+}
+
+/// Build UCX from source and return the include path.
+fn build_from_source() -> String {
     let dst = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
     // Return if the outputs exist.
@@ -57,7 +92,7 @@ fn build_from_source() {
         && dst.join("lib/libucm.a").exists()
         && dst.join("lib/libucp.a").exists()
     {
-        return;
+        return dst.join("include").display().to_string();
     }
 
     // Initialize git submodule if necessary.
@@ -107,4 +142,13 @@ fn build_from_source() {
         .arg("install")
         .status()
         .expect("failed to make install");
+
+    // Tell cargo to link all UCX libraries (only needed when building from source)
+    // When building static libraries, we need to link them in dependency order
+    println!("cargo:rustc-link-lib=static=ucp");
+    println!("cargo:rustc-link-lib=static=uct");
+    println!("cargo:rustc-link-lib=static=ucs");
+    println!("cargo:rustc-link-lib=static=ucm");
+
+    dst.join("include").display().to_string()
 }

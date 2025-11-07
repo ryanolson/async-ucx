@@ -1,3 +1,5 @@
+use super::param::RequestParam;
+
 use super::*;
 
 /// A memory region allocated through UCP library,
@@ -88,12 +90,11 @@ impl RKey {
     /// Create remote access key from packed buffer.
     pub fn unpack(endpoint: &Endpoint, rkey_buffer: &[u8]) -> Self {
         let mut handle = MaybeUninit::<*mut ucp_rkey>::uninit();
+        let ep_handle = endpoint
+            .get_handle()
+            .expect("Endpoint must be valid for rkey unpack");
         let status = unsafe {
-            ucp_ep_rkey_unpack(
-                endpoint.handle,
-                rkey_buffer.as_ptr() as _,
-                handle.as_mut_ptr(),
-            )
+            ucp_ep_rkey_unpack(ep_handle, rkey_buffer.as_ptr() as _, handle.as_mut_ptr())
         };
         assert_eq!(status, ucs_status_t::UCS_OK);
         RKey {
@@ -111,20 +112,26 @@ impl Drop for RKey {
 impl Endpoint {
     /// Stores a contiguous block of data into remote memory.
     pub async fn put(&self, buf: &[u8], remote_addr: u64, rkey: &RKey) -> Result<(), Error> {
-        trace!("put: endpoint={:?} len={}", self.handle, buf.len());
-        unsafe extern "C" fn callback(request: *mut c_void, status: ucs_status_t) {
+        let ep_handle = self.get_handle()?;
+        trace!("put: endpoint={:?} len={}", ep_handle, buf.len());
+        unsafe extern "C" fn callback(
+            request: *mut c_void,
+            status: ucs_status_t,
+            _user_data: *mut c_void,
+        ) {
             trace!("put: complete. req={:?}, status={:?}", request, status);
             let request = &mut *(request as *mut Request);
             request.waker.wake();
         }
+        let param = RequestParam::new().cb_send(Some(callback));
         let status = unsafe {
-            ucp_put_nb(
+            ucp_put_nbx(
                 self.get_handle()?,
                 buf.as_ptr() as _,
                 buf.len() as _,
                 remote_addr,
                 rkey.handle,
-                Some(callback),
+                param.as_ref(),
             )
         };
         if status.is_null() {
@@ -143,20 +150,26 @@ impl Endpoint {
 
     /// Loads a contiguous block of data from remote memory.
     pub async fn get(&self, buf: &mut [u8], remote_addr: u64, rkey: &RKey) -> Result<(), Error> {
-        trace!("get: endpoint={:?} len={}", self.handle, buf.len());
-        unsafe extern "C" fn callback(request: *mut c_void, status: ucs_status_t) {
+        let ep_handle = self.get_handle()?;
+        trace!("get: endpoint={:?} len={}", ep_handle, buf.len());
+        unsafe extern "C" fn callback(
+            request: *mut c_void,
+            status: ucs_status_t,
+            _user_data: *mut c_void,
+        ) {
             trace!("get: complete. req={:?}, status={:?}", request, status);
             let request = &mut *(request as *mut Request);
             request.waker.wake();
         }
+        let param = RequestParam::new().cb_send(Some(callback));
         let status = unsafe {
-            ucp_get_nb(
+            ucp_get_nbx(
                 self.get_handle()?,
                 buf.as_mut_ptr() as _,
                 buf.len() as _,
                 remote_addr,
                 rkey.handle,
-                Some(callback),
+                param.as_ref(),
             )
         };
         if status.is_null() {

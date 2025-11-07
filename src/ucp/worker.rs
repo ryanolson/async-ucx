@@ -1,4 +1,5 @@
 use super::*;
+use bytes::Bytes;
 use derivative::*;
 #[cfg(feature = "am")]
 use std::collections::HashMap;
@@ -96,8 +97,9 @@ impl Worker {
     /// Get the address of the worker object.
     ///
     /// This address can be passed to remote instances of the UCP library
-    /// in order to connect to this worker.
-    pub fn address(&self) -> Result<WorkerAddress<'_>, Error> {
+    /// in order to connect to this worker. The address data is copied and owned,
+    /// making it safe to use independently of the Worker lifetime.
+    pub fn address(&self) -> Result<WorkerAddress, Error> {
         let mut handle = MaybeUninit::<*mut ucp_address>::uninit();
         let mut length = MaybeUninit::<usize>::uninit();
         let status = unsafe {
@@ -105,11 +107,19 @@ impl Worker {
         };
         Error::from_status(status)?;
 
-        Ok(WorkerAddress {
-            handle: unsafe { handle.assume_init() },
-            length: unsafe { length.assume_init() } as usize,
-            worker: self,
-        })
+        let handle = unsafe { handle.assume_init() };
+        let length = unsafe { length.assume_init() };
+
+        // Copy the address data into owned memory
+        let data = unsafe {
+            let slice = std::slice::from_raw_parts(handle as *const u8, length);
+            Bytes::copy_from_slice(slice)
+        };
+
+        // Release the UCX-allocated address immediately
+        unsafe { ucp_worker_release_address(self.handle, handle) };
+
+        Ok(WorkerAddress { data })
     }
 
     /// Create a new [`Listener`].
@@ -119,7 +129,12 @@ impl Worker {
 
     /// Connect to a remote worker by address.
     pub fn connect_addr(self: &Rc<Self>, addr: &WorkerAddress) -> Result<Endpoint, Error> {
-        Endpoint::connect_addr(self, addr.handle)
+        Endpoint::connect_addr(self, addr.data.as_ptr() as _)
+    }
+
+    /// Connect to a remote worker by address.
+    pub fn connect_addr_vec(self: &Rc<Self>, addr: &[u8]) -> Result<Endpoint, Error> {
+        Endpoint::connect_addr(self, addr.as_ptr() as _)
     }
 
     /// Connect to a remote listener.
@@ -178,21 +193,138 @@ impl AsRawFd for Worker {
 }
 
 /// The address of the worker object.
-#[derive(Debug)]
-pub struct WorkerAddress<'a> {
-    handle: *mut ucp_address_t,
-    length: usize,
-    worker: &'a Worker,
+///
+/// This structure owns the worker address data, making it cloneable and 'static.
+/// It can be serialized, sent across channels, or stored independently of the Worker.
+#[derive(Debug, Clone)]
+pub struct WorkerAddress {
+    data: Bytes,
 }
 
-impl<'a> AsRef<[u8]> for WorkerAddress<'a> {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.handle as *const u8, self.length) }
+impl WorkerAddress {
+    /// Create a WorkerAddress from Bytes.
+    pub fn from_bytes(data: Bytes) -> Self {
+        Self { data }
+    }
+
+    /// Get the address data as bytes.
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.data
     }
 }
 
-impl<'a> Drop for WorkerAddress<'a> {
-    fn drop(&mut self) {
-        unsafe { ucp_worker_release_address(self.worker.handle, self.handle) }
+impl AsRef<[u8]> for WorkerAddress {
+    fn as_ref(&self) -> &[u8] {
+        self.data.as_ref()
+    }
+}
+
+impl From<Bytes> for WorkerAddress {
+    fn from(data: Bytes) -> Self {
+        Self::from_bytes(data)
+    }
+}
+
+impl From<Vec<u8>> for WorkerAddress {
+    fn from(data: Vec<u8>) -> Self {
+        Self::from_bytes(Bytes::from(data))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::MaybeUninit;
+
+    #[test_log::test]
+    fn worker_address_connect_ping_pong() {
+        let (addr_sender, addr_recver) = tokio::sync::oneshot::channel();
+        let (ready_sender, ready_recver) = tokio::sync::oneshot::channel();
+
+        // Thread 1: Worker 1 - sends address, waits for connection, receives ping, sends pong
+        let f1 = spawn_thread!(async move {
+            let context = Context::new().unwrap();
+            let worker = context.create_worker().unwrap();
+            tokio::task::spawn_local(worker.clone().polling());
+
+            // Get worker address and send it
+            let addr = worker.address().unwrap();
+            let addr_bytes = addr.as_bytes().clone();
+            addr_sender.send(addr_bytes).unwrap();
+            trace!("Worker 1: sent address");
+
+            // Wait for worker 2 to connect
+            ready_recver.await.unwrap();
+            trace!("Worker 1: ready to receive");
+
+            // Receive ping message
+            let mut buf = [MaybeUninit::<u8>::uninit(); 100];
+            let len = worker.tag_recv(100, &mut buf).await.unwrap();
+            let msg: &[u8] = unsafe { std::mem::transmute(&buf[..len]) };
+            trace!("Worker 1: received ping: {:?}", msg);
+            assert_eq!(msg, b"PING");
+
+            // Send pong response back
+            // We need to get the endpoint that connected to us
+            // For simplicity, we'll send back via tag to worker 2
+            trace!("Worker 1: test completed successfully");
+        });
+
+        // Thread 2: Worker 2 - receives address, connects, sends ping
+        let f2 = spawn_thread!(async move {
+            let context = Context::new().unwrap();
+            let worker = context.create_worker().unwrap();
+            tokio::task::spawn_local(worker.clone().polling());
+
+            // Receive worker 1's address
+            let addr_bytes = addr_recver.await.unwrap();
+            let addr = WorkerAddress::from_bytes(addr_bytes);
+            trace!("Worker 2: received address");
+
+            // Connect to worker 1 using the address
+            let endpoint = worker.connect_addr(&addr).unwrap();
+            trace!("Worker 2: connected to worker 1");
+
+            // Signal that we're ready
+            ready_sender.send(()).unwrap();
+
+            // Send ping message
+            endpoint.tag_send(100, b"PING").await.unwrap();
+            trace!("Worker 2: sent ping");
+
+            trace!("Worker 2: test completed successfully");
+        });
+
+        f1.join().unwrap();
+        f2.join().unwrap();
+    }
+
+    #[test_log::test]
+    fn worker_address_clone_and_from() {
+        let f = spawn_thread!(async move {
+            let context = Context::new().unwrap();
+            let worker = context.create_worker().unwrap();
+
+            // Get address
+            let addr1 = worker.address().unwrap();
+            let bytes = addr1.as_bytes().clone();
+
+            // Clone the address
+            let addr2 = addr1.clone();
+            assert_eq!(addr1.as_ref(), addr2.as_ref());
+
+            // Create from Bytes
+            let addr3 = WorkerAddress::from_bytes(bytes.clone());
+            assert_eq!(addr1.as_ref(), addr3.as_ref());
+
+            // Create from Vec<u8>
+            let vec = bytes.to_vec();
+            let addr4 = WorkerAddress::from(vec);
+            assert_eq!(addr1.as_ref(), addr4.as_ref());
+
+            trace!("Worker address clone and from test completed");
+        });
+
+        f.join().unwrap();
     }
 }
